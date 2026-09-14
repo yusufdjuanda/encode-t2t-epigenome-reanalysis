@@ -1,0 +1,30 @@
+[workspace]
+name = "encode-t2t-epigenome-reanalysis"
+description = "Pixi environments for this workflow: the Snakemake workflow manager, and an isolated ENCODEfetch environment for resolving/downloading ENCODE accessions."
+channels = ["conda-forge", "bioconda"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = "3.11.*"
+
+[feature.workflow.dependencies]
+snakemake-minimal = ">=8,<9"
+snakemake-executor-plugin-slurm = "*"
+pandas = ">=2,<3"
+pyyaml = ">=6,<7"
+jupyterlab = ">=4,<5"
+ipykernel = ">=7.3.0,<8"
+
+[feature.fetch.pypi-dependencies]
+encodefetch = "*"
+
+[environments]
+default = { features = ["workflow"] }
+fetch = { features = ["fetch"] }
+
+[tasks]
+snakemake = "snakemake"
+jupyter = "jupyter lab"
+
+[feature.fetch.tasks]
+encodefetch = "encodefetch"

@@ -1,0 +1,8 @@
+name: encode-t2t-alignment-paper-exact
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bowtie2=2.4.1
+  - samtools=1.10
+  - picard=2.22.1

@@ -1,0 +1,10 @@
+# Phase 1 pilot (docs/replication-plan.md): one mark + its matched input control.
+#
+# Source: Gershman et al. 2022, Science, Table S1 ("ENCODE accessions"),
+# biosample C4-2B, target CTCF. Chosen as the smallest combined read count
+# (CTCF + matched Control) among all cell type / mark pairs in Table S1, to
+# keep the first end-to-end run fast.
+#
+# ENCODEfetch resolves the matched Control experiment (ENCSR585FQO)
+# automatically from this accession alone via --control-strategy.
+ENCSR460LGH

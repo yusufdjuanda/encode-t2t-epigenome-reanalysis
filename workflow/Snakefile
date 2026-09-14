@@ -1,0 +1,48 @@
+from pathlib import Path
+
+configfile: "config/config.yaml"
+
+RESULTS = config["paths"]["results"]
+LOGS = config["paths"]["logs"]
+DATA = config["paths"]["data"]
+ACCESSIONS = config["accessions"]["pilot_file"]
+ASSAY_TITLE = config["accessions"]["assay_title"]
+CONTROL_STRATEGY = config["accessions"]["control_strategy"]
+
+
+rule all:
+    input:
+        f"{DATA}/accessions/manifest.tsv"
+
+
+rule resolve_accessions:
+    # Accessions/FASTQs are the same regardless of paper_exact vs. modern,
+    # so this writes under paths.data rather than the mode-specific RESULTS.
+    input:
+        accessions=ACCESSIONS
+    output:
+        manifest=f"{DATA}/accessions/manifest.tsv",
+        metadata=f"{DATA}/accessions/metadata.jsonl",
+        samplesheet=f"{DATA}/accessions/samples.csv"
+    params:
+        assay_title=ASSAY_TITLE,
+        control_strategy=CONTROL_STRATEGY
+    log:
+        f"{LOGS}/setup/00_resolve_accessions.log"
+    script:
+        "scripts/00_resolve_accessions.py"
+
+
+rule download_fastqs:
+    input:
+        accessions=ACCESSIONS,
+        manifest=f"{DATA}/accessions/manifest.tsv"
+    output:
+        done=f"{DATA}/fastq/download.verified"
+    params:
+        assay_title=ASSAY_TITLE,
+        control_strategy=CONTROL_STRATEGY
+    log:
+        f"{LOGS}/setup/01_download_fastqs.log"
+    script:
+        "scripts/01_download_fastqs.py"

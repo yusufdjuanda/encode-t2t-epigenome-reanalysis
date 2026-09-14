@@ -1,0 +1,22 @@
+executor: slurm
+jobs: 20
+latency-wait: 60
+rerun-incomplete: true
+printshellcmds: true
+show-failed-logs: true
+
+default-resources:
+  slurm_partition: cpu
+  cpus_per_task: 1
+  mem_mb: 4000
+  runtime: 60
+
+set-resources:
+  resolve_accessions:
+    cpus_per_task: 1
+    mem_mb: 1000
+    runtime: 15
+  download_fastqs:
+    cpus_per_task: 4
+    mem_mb: 4000
+    runtime: 360

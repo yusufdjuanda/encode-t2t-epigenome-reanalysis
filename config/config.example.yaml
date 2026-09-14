@@ -1,0 +1,31 @@
+analysis_mode: paper_exact
+
+accessions:
+  # One or more ENCODE experiment accessions (ENCSR...), one per line, in a
+  # file ENCODEfetch reads directly. Matched input-control experiments are
+  # resolved automatically. See resources/accessions/pilot_accessions.txt.
+  pilot_file: resources/accessions/pilot_accessions.txt
+  assay_title: TF ChIP-seq
+  control_strategy: best
+
+reference:
+  name: T2T-CHM13v1.0
+  fasta: resources/reference/T2T-CHM13v1.0.fa
+  bowtie2_index_prefix: resources/indexes/bowtie2/T2T-CHM13v1.0
+
+paths:
+  data: data
+  results: results/paper_exact
+  logs: logs/paper_exact
+  benchmarks: benchmarks/paper_exact
+
+alignment:
+  threads: 16
+  minimum_mapq: 1
+
+peak_calling:
+  genome_size: 3030000000
+
+# Replace these placeholders only after checking the paper's archived
+# environment and supplementary methods.
+software_profile: paper_exact

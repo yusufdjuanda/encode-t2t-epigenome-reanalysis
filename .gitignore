@@ -1,0 +1,46 @@
+# Local configuration and secrets
+config/config.yaml
+.env
+
+# Workflow state and environments
+.snakemake/
+.pixi/
+pixi.lock
+
+# Bulk inputs and generated outputs
+data/
+results/
+logs/
+benchmarks/
+scratch/
+resources/reference/
+resources/indexes/
+
+# Sequencing and genomics files
+*.fastq
+*.fastq.gz
+*.fq
+*.fq.gz
+*.bam
+*.bai
+*.cram
+*.crai
+*.bigWig
+*.bw
+*.bed.gz
+*.tbi
+*.bt2
+*.bt2l
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.ipynb_checkpoints/
