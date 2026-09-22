@@ -9,22 +9,89 @@ accessions:
   control_strategy: best
 
 reference:
-  name: T2T-CHM13v1.0
-  fasta: resources/reference/T2T-CHM13v1.0.fa
-  bowtie2_index_prefix: resources/indexes/bowtie2/T2T-CHM13v1.0
+  # T2T-CHM13 v2.0 for all modes. The paper used v1.0; this is deviation D1 in
+  # docs/replication-plan.md. Karakoram shares this bundle under
+  # /storage/datasets/ref_genomes; elsewhere, point these at local copies.
+  name: T2T-CHM13v2.0
+  fasta: /storage/datasets/ref_genomes/t2t_chm13v2/reference/T2T-CHM13v2.0.fa
+  bowtie2_index_prefix: /storage/datasets/ref_genomes/t2t_chm13v2/bowtie2/T2T-CHM13v2.0
 
 paths:
+  # Files derived from the reference (k-mer tracks) and built tools,
+  # shared by every analysis mode.
+  references: references
   data: data
   results: results/paper_exact
   logs: logs/paper_exact
   benchmarks: benchmarks/paper_exact
 
 alignment:
-  threads: 16
-  minimum_mapq: 1
+  # bowtie2 threads (= Slurm CPUs) per library, scaled by the gzipped FASTQ
+  # pair size: 8 per GB, rounded up to a multiple of 4, kept within min..max.
+  threads_per_fastq_gb: 8
+  min_threads: 16
+  max_threads: 48
+  # samtools sort memory per thread.
+  sort_threads: 8
+  sort_memory_gb: 4
+  runtime_minutes: 720
+  # Longest fragment bowtie2 accepts as a proper pair (-X). bowtie2's default
+  # is 500; ENCODE's ChIP-seq pipeline uses 2000. For paper_exact, use the
+  # paper's value if its methods state one.
+  max_fragment_length: 2000
+  # Lmod modules loaded for each alignment job (Snakemake envmodules). The
+  # paper-exact versions in workflow/envs/alignment.paper-exact.yaml are not
+  # available as Karakoram modules.
+  envmodules:
+    - bowtie2/2.5.5
+    - samtools/1.23.1
+
+filtering:
+  # Paper: samtools view -F 1804 -f 2 -q 2, then Picard MarkDuplicates with
+  # REMOVE_DUPLICATES=true.
+  exclude_flags: 1804
+  require_flags: 2
+  minimum_mapq: 2
+  picard_memory_gb: 16
+  envmodules:
+    - samtools/1.23.1
+    - picard/3.4.0
+
+kmer_filter:
+  # Paper (authors' code): k-mer sizes 50, 75-100 by 5; each mate uses the
+  # largest size below its aligned reference span.
+  sizes: [50, 75, 80, 85, 90, 95, 100]
+  # Sequences left out of k-mer counting and tracks. Reads on them fail the
+  # filter. chrY (NC_060948.1) excluded: deviation D1.
+  exclude_chromosomes:
+    - NC_060948.1
+  # The authors' KMC fork (branch kmer_mapping), at the version used for the
+  # paper; it provides kmc_genome_counts.
+  kmc_repository: https://github.com/msauria/KMC.git
+  kmc_commit: 95c9190d4c
+  kmc_memory_gb: 64
+  kmc_threads: 32
+  # Peak memory of wigToBigWig on a genome-wide fixedStep wiggle; an estimate.
+  track_memory_gb: 256
+  wigtobigwig_url: https://hgdownload.soe.ucsc.edu/admin/exe/linux.x86_64/wigToBigWig
+  # Python with pysam and pyBigWig, plus samtools.
+  envmodules:
+    - deeptools/3.5.6
+    - samtools/1.23.1
 
 peak_calling:
-  genome_size: 3030000000
+  # Effective genome size for T2T-CHM13 v2 at 100 bp reads, from the deepTools
+  # table (for MAPQ-filtered data). The paper used 3.03e9 for CHM13 v1.0:
+  # deviation D9.
+  genome_size: 2814334875
+  # Paper: broad peaks for these marks, narrow for everything else.
+  broad_marks: [H3K9me3, H3K27me3, H3K36me3]
+  envmodules:
+    - macs3/3.0.4
+
+comparison:
+  # Authors' sample list and results (resources/paper/T2T_Encode_Analysis/README.md).
+  authors_results: resources/paper/T2T_Encode_Analysis
 
 # Replace these placeholders only after checking the paper's archived
 # environment and supplementary methods.

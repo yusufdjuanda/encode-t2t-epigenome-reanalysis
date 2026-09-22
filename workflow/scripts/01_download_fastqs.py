@@ -1,8 +1,4 @@
-"""Download the FASTQs resolved by 00_resolve_accessions.py via ENCODEfetch,
-then verify every downloaded file's MD5 against the manifest ENCODEfetch
-itself recorded. Intended to run on Karakoram via Slurm (large transfer),
-not on a laptop or the login node.
-"""
+"""Download ENCODE FASTQs from declared accessions and verify MD5 checksums."""
 
 import csv
 import hashlib
@@ -10,7 +6,9 @@ import subprocess
 from pathlib import Path
 
 accessions = Path(snakemake.input.accessions)
-manifest_in = Path(snakemake.input.manifest)
+manifest_out = Path(snakemake.output.manifest)
+metadata_out = Path(snakemake.output.metadata)
+samplesheet_out = Path(snakemake.output.samplesheet)
 done_marker = Path(snakemake.output.done)
 outdir = done_marker.parent
 log_path = Path(snakemake.log[0])
@@ -57,24 +55,25 @@ def md5sum(path: Path) -> str:
 
 
 expected = {}
-with manifest_in.open(newline="") as handle:
+with manifest_out.open(newline="") as handle:
     for row in csv.DictReader(handle, delimiter="\t"):
-        if row.get("file_accession") and row.get("md5sum"):
-            expected[row["file_accession"]] = row["md5sum"]
-        if row.get("file_accession_r2") and row.get("md5sum_r2"):
-            expected[row["file_accession_r2"]] = row["md5sum_r2"]
+        if row.get("file_accession") and row.get("md5sum") and row.get("local_path"):
+            expected[row["file_accession"]] = (row["md5sum"], Path(row["local_path"]))
+        if row.get("file_accession_r2") and row.get("md5sum_r2") and row.get("local_path_r2"):
+            expected[row["file_accession_r2"]] = (
+                row["md5sum_r2"],
+                Path(row["local_path_r2"]),
+            )
 
-fastqs = {p.name.split(".")[0]: p for p in outdir.rglob("*.fastq.gz")}
+if not expected:
+    raise ValueError(f"No FASTQ paths/checksums found in manifest: {manifest_out}")
 
-missing = expected.keys() - fastqs.keys()
+missing = [accession for accession, (_, path) in expected.items() if not path.exists()]
 if missing:
     raise FileNotFoundError(f"Downloaded FASTQs missing for accessions: {sorted(missing)}")
 
 mismatches = []
-for accession, path in fastqs.items():
-    want = expected.get(accession)
-    if want is None:
-        continue
+for accession, (want, path) in expected.items():
     got = md5sum(path)
     if got != want:
         mismatches.append((accession, want, got))
@@ -83,5 +82,9 @@ if mismatches:
     lines = "\n".join(f"{a}: expected {w}, got {g}" for a, w, g in mismatches)
     raise ValueError(f"Checksum mismatch for downloaded FASTQs:\n{lines}")
 
-done_marker.parent.mkdir(parents=True, exist_ok=True)
-done_marker.write_text(f"Verified {len(fastqs)} FASTQ files against {manifest_in}.\n")
+if not metadata_out.exists():
+    raise FileNotFoundError(f"encodefetch did not write {metadata_out}")
+if not samplesheet_out.exists():
+    raise FileNotFoundError(f"encodefetch did not write {samplesheet_out}")
+
+done_marker.write_text(f"Verified {len(expected)} FASTQ files against {manifest_out}.\n")

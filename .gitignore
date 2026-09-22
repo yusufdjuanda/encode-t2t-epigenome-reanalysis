@@ -13,6 +13,7 @@ results/
 logs/
 benchmarks/
 scratch/
+references/
 resources/reference/
 resources/indexes/
 
@@ -44,3 +45,8 @@ __pycache__/
 .pytest_cache/
 
 .ipynb_checkpoints/
+
+# Papers and local notes (kept out of the repository)
+*.pdf
+karakoram-hpc-summary.md
+logs-align-*.txt

@@ -1,44 +1,348 @@
+import csv
+import math
+import os
 from pathlib import Path
 
 configfile: "config/config.yaml"
 
 RESULTS = config["paths"]["results"]
 LOGS = config["paths"]["logs"]
+BENCHMARKS = config["paths"]["benchmarks"]
 DATA = config["paths"]["data"]
 ACCESSIONS = config["accessions"]["pilot_file"]
 ASSAY_TITLE = config["accessions"]["assay_title"]
 CONTROL_STRATEGY = config["accessions"]["control_strategy"]
+REFERENCES = config["paths"]["references"]
+REFERENCE_NAME = config["reference"]["name"]
+REFERENCE_FASTA = config["reference"]["fasta"]
+REFERENCE_INDEX_PREFIX = config["reference"]["bowtie2_index_prefix"]
+SCRIPTS_DIR = Path(workflow.basedir) / "scripts"
+FASTQ_MANIFEST = f"{DATA}/fastq/manifest.tsv"
+FASTQ_METADATA = f"{DATA}/fastq/metadata.jsonl"
+# ENCODEfetch names the samplesheet after the assay, e.g. "TF ChIP-seq" ->
+# snakemake_tf_chip-seq_samplesheet.csv.
+FASTQ_SAMPLESHEET = (
+    f"{DATA}/fastq/snakemake_{ASSAY_TITLE.lower().replace(' ', '_')}_samplesheet.csv"
+)
+FASTQ_VERIFIED = f"{DATA}/fastq/download.verified"
+ALIGNMENT_DIR = f"{RESULTS}/alignment/{REFERENCE_NAME}"
+ALIGNMENT_MANIFEST = f"{ALIGNMENT_DIR}/alignment_manifest.tsv"
+REPLICATE_MANIFEST = f"{ALIGNMENT_DIR}/replicate_manifest.tsv"
+ALIGNED_BAM = f"{ALIGNMENT_DIR}/{{library}}.sorted.bam"
+REPLICATE_BAM = f"{ALIGNMENT_DIR}/replicates/{{replicate}}.sorted.bam"
+
+# Step 03: read filter and duplicate removal, per replicate.
+FILTER_DIR = f"{RESULTS}/filtering/{REFERENCE_NAME}"
+FILTERED_BAM = f"{FILTER_DIR}/filtered/{{replicate}}.bam"
+DEDUP_BAM = f"{FILTER_DIR}/dedup/{{replicate}}.bam"
+# Step 04: unique-k-mer filter, per replicate.
+KMER_BAM = f"{FILTER_DIR}/kmer/{{replicate}}.bam"
+FLAGSTAT = f"{FILTER_DIR}/flagstat/{{step}}/{{replicate}}.json"
+# The BAM each flagstat step counts: mapped, filtered, dedup and kmer, as in
+# the authors' mapping_stats.txt.
+STEP_BAMS = {
+    "mapped": REPLICATE_BAM,
+    "filtered": FILTERED_BAM,
+    "dedup": DEDUP_BAM,
+    "kmer": KMER_BAM,
+}
+
+# Unique-k-mer tracks depend only on the reference, so they live outside the
+# per-mode results and are shared by every run on that reference.
+KMER_SETTINGS = config["kmer_filter"]
+KMER_SIZES = [int(k) for k in KMER_SETTINGS["sizes"]]
+TOOLS_DIR = f"{REFERENCES}/tools"
+KMC_DIR = f"{TOOLS_DIR}/KMC-{KMER_SETTINGS['kmc_commit']}"
+KMC_BIN = f"{KMC_DIR}/kmc"
+KMC_GENOME_COUNTS = f"{KMC_DIR}/kmc_genome_counts"
+WIGTOBIGWIG = f"{TOOLS_DIR}/wigToBigWig"
+KMER_DIR = f"{REFERENCES}/{REFERENCE_NAME}/kmer"
+KMER_FASTA = f"{KMER_DIR}/{REFERENCE_NAME}.kmer_chromosomes.fa"
+KMER_DB = f"{KMER_DIR}/kmc/{REFERENCE_NAME}_k{{k}}"
+KMER_TRACK = f"{KMER_DIR}/{REFERENCE_NAME}.k{{k}}.unique_kmer_counts.bw"
+
+# Step 05: replicates pooled per experiment, peaks against the pooled control.
+PEAKS_DIR = f"{RESULTS}/peaks/{REFERENCE_NAME}"
+POOLED_BAM = f"{PEAKS_DIR}/pooled/{{experiment}}.bam"
+PEAKS = f"{PEAKS_DIR}/macs3/{{experiment}}_peaks.{{peak_type}}Peak"
+
+# Step 06: comparison with the authors' results.
+COMPARISON_DIR = f"{RESULTS}/comparison/{REFERENCE_NAME}"
+MAPPING_STATS = f"{COMPARISON_DIR}/mapping_stats.tsv"
+PAPER_COMPARISON = f"{COMPARISON_DIR}/paper_comparison.tsv"
+
+
+wildcard_constraints:
+    library=r"[A-Za-z0-9_-]+",
+    replicate=r"[A-Za-z0-9_-]+",
+    experiment=r"[A-Za-z0-9_-]+",
+    step="|".join(STEP_BAMS),
+    k="|".join(str(k) for k in KMER_SIZES),
+    peak_type="narrow|broad",
+
+
+localrules:
+    all,
+    alignment_manifests,
+    download_wigtobigwig,
+    compare_with_paper,
+
+
+def bowtie2_index_files(prefix):
+    bt2 = [f"{prefix}.{suffix}.bt2" for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
+    bt2l = [f"{prefix}.{suffix}.bt2l" for suffix in ("1", "2", "3", "4", "rev.1", "rev.2")]
+    if Path(bt2[0]).exists():
+        return bt2
+    return bt2l
+
+
+def replicate_id(sample, group, replicate):
+    return f"{sample}__{group}__rep{replicate}"
+
+
+def library_id(row):
+    # The FASTQ accessions keep IDs unique when a replicate has several FASTQ pairs.
+    r1_accession = Path(row["fastq_1"]).name.split(".")[0]
+    r2_accession = Path(row["fastq_2"]).name.split(".")[0]
+    return (
+        f"{replicate_id(row['sample'], row['group'], row['replicate'])}"
+        f"__{r1_accession}_{r2_accession}"
+    )
+
+
+def libraries():
+    """Samplesheet rows keyed by library ID, available once download_fastqs has run.
+
+    Calling .get() on the checkpoint makes Snakemake run download_fastqs first
+    and re-evaluate the DAG afterwards, so the set of libraries doesn't have to
+    be known when the workflow starts.
+    """
+    samplesheet = checkpoints.download_fastqs.get().output.samplesheet
+    # ENCODEfetch writes this ".csv" tab-separated.
+    with open(samplesheet, newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    if not rows:
+        raise ValueError(f"No rows found in samplesheet: {samplesheet}")
+    table = {}
+    for row in rows:
+        # A control shared by several experiments is listed once per experiment.
+        # Identical repeats are the same library; anything else is a conflict.
+        existing = table.setdefault(library_id(row), row)
+        if existing != row:
+            raise ValueError(
+                f"Conflicting samplesheet rows for library {library_id(row)}: "
+                f"{existing} vs {row}"
+            )
+    return table
+
+
+def replicates():
+    """Libraries grouped into biological replicates, keyed by replicate ID.
+
+    Each case replicate also records which control replicate it is compared
+    against in peak calling.
+    """
+    table = {}
+    for library, row in libraries().items():
+        rep = replicate_id(row["sample"], row["group"], row["replicate"])
+        entry = table.setdefault(
+            rep,
+            {
+                "sample": row["sample"],
+                "group": row["group"],
+                "replicate": row["replicate"],
+                "control": row["control"],
+                "control_replicate": row["control_replicate"],
+                "antibody": row["antibody"],
+                "libraries": [],
+            },
+        )
+        for key in ("control", "control_replicate", "antibody"):
+            if entry[key] != row[key]:
+                raise ValueError(f"Libraries of {rep} disagree on {key}: {entry[key]!r} vs {row[key]!r}")
+        entry["libraries"].append(library)
+
+    for rep, entry in table.items():
+        entry["control_replicate_id"] = ""
+        if not entry["control"]:
+            continue
+        control_reps = sorted(
+            other for other, e in table.items()
+            if e["sample"] == entry["control"] and e["group"] == "control"
+        )
+        wanted = replicate_id(entry["control"], "control", entry["control_replicate"])
+        if wanted in control_reps:
+            entry["control_replicate_id"] = wanted
+        elif len(control_reps) == 1:
+            # ENCODEfetch's "best" strategy can pair case rep N with control rep N
+            # even when the control only has one replicate; use that replicate.
+            entry["control_replicate_id"] = control_reps[0]
+        else:
+            raise ValueError(
+                f"{rep} names control replicate {wanted}, which is not in the "
+                f"samplesheet (control replicates found: {control_reps})"
+            )
+    return table
+
+
+def library_fastqs(wildcards):
+    row = libraries().get(wildcards.library)
+    if row is None:
+        raise ValueError(f"Library {wildcards.library!r} is not in {FASTQ_SAMPLESHEET}")
+    return {"fastq_1": row["fastq_1"], "fastq_2": row["fastq_2"]}
+
+
+def read_group(wildcards):
+    # One read group per FASTQ pair. Every run of a replicate shares SM and LB
+    # (ENCODE sequences one library per replicate), so duplicate marking after
+    # the merge treats them as one library.
+    row = libraries()[wildcards.library]
+    rep = replicate_id(row["sample"], row["group"], row["replicate"])
+    return f"--rg-id {wildcards.library} --rg SM:{rep} --rg LB:{rep} --rg PL:ILLUMINA"
+
+
+def align_threads(wildcards, input):
+    """Scale bowtie2 threads with the gzipped FASTQ pair size, in steps of 4.
+
+    The index files are also inputs, so only the two FASTQs are measured.
+    """
+    settings = config["alignment"]
+    fastq_gb = (os.path.getsize(input.fastq_1) + os.path.getsize(input.fastq_2)) / 1e9
+    wanted = math.ceil(fastq_gb * settings["threads_per_fastq_gb"] / 4) * 4
+    return max(settings["min_threads"], min(settings["max_threads"], wanted))
+
+
+def align_mem_mb(wildcards, threads):
+    # bowtie2 index + per-thread buffers, plus samtools sort holding up to
+    # sort_threads x sort_memory_gb in memory, with 25% headroom for sort.
+    settings = config["alignment"]
+    sort_mb = settings["sort_threads"] * settings["sort_memory_gb"] * 1024 * 1.25
+    return int(6000 + 50 * threads + sort_mb)
+
+
+def aligned_bams(wildcards):
+    return expand(ALIGNED_BAM, library=libraries())
+
+
+def replicate_library_bams(wildcards):
+    entry = replicates().get(wildcards.replicate)
+    if entry is None:
+        raise ValueError(f"Replicate {wildcards.replicate!r} is not in {FASTQ_SAMPLESHEET}")
+    return expand(ALIGNED_BAM, library=entry["libraries"])
+
+
+def replicate_bams(wildcards):
+    return expand(REPLICATE_BAM, replicate=replicates())
+
+
+def experiment_id(sample, group):
+    return f"{sample}__{group}"
+
+
+def experiments():
+    """Replicates grouped per ENCODE experiment, keyed by experiment ID.
+
+    As in the paper, peaks are called on all replicates of an experiment pooled,
+    against all replicates of its control experiment pooled.
+    """
+    table = {}
+    for rep, entry in replicates().items():
+        exp = experiment_id(entry["sample"], entry["group"])
+        experiment = table.setdefault(
+            exp,
+            {
+                "sample": entry["sample"],
+                "group": entry["group"],
+                "antibody": entry["antibody"],
+                "control": entry["control"],
+                "replicates": [],
+            },
+        )
+        for key in ("antibody", "control"):
+            if experiment[key] != entry[key]:
+                raise ValueError(f"Replicates of {exp} disagree on {key}: {experiment[key]!r} vs {entry[key]!r}")
+        experiment["replicates"].append(rep)
+
+    broad_marks = set(config["peak_calling"]["broad_marks"])
+    for exp, experiment in table.items():
+        experiment["control_experiment"] = ""
+        experiment["peak_type"] = ""
+        if experiment["group"] == "control":
+            continue
+        control_exp = experiment_id(experiment["control"], "control")
+        if control_exp not in table:
+            raise ValueError(f"{exp} names control {experiment['control']!r}, which is not in {FASTQ_SAMPLESHEET}")
+        experiment["control_experiment"] = control_exp
+        experiment["peak_type"] = "broad" if experiment["antibody"] in broad_marks else "narrow"
+    return table
+
+
+def case_experiments():
+    return [exp for exp, experiment in experiments().items() if experiment["control_experiment"]]
+
+
+def kmer_chromosomes():
+    """Reference sequences the k-mer tracks cover: all but the configured exclusions."""
+    with open(f"{REFERENCE_FASTA}.fai") as handle:
+        names = [line.split("\t")[0] for line in handle]
+    excluded = set(KMER_SETTINGS["exclude_chromosomes"])
+    missing = excluded.difference(names)
+    if missing:
+        raise ValueError(f"kmer_filter.exclude_chromosomes not in {REFERENCE_FASTA}: {sorted(missing)}")
+    return [name for name in names if name not in excluded]
+
+
+def flagstat_keys():
+    return [(step, rep) for rep in replicates() for step in STEP_BAMS]
+
+
+def flagstat_files(wildcards):
+    return [FLAGSTAT.format(step=step, replicate=rep) for step, rep in flagstat_keys()]
+
+
+def peak_files(wildcards):
+    table = experiments()
+    return [PEAKS.format(experiment=exp, peak_type=table[exp]["peak_type"]) for exp in case_experiments()]
+
+
+def pooled_replicate_bams(wildcards):
+    experiment = experiments().get(wildcards.experiment)
+    if experiment is None:
+        raise ValueError(f"Experiment {wildcards.experiment!r} is not in {FASTQ_SAMPLESHEET}")
+    return expand(KMER_BAM, replicate=experiment["replicates"])
+
+
+def peak_calling_bams(wildcards):
+    experiment = experiments().get(wildcards.experiment)
+    if experiment is None or not experiment["control_experiment"]:
+        raise ValueError(f"{wildcards.experiment!r} is not a case experiment with a control")
+    if experiment["peak_type"] != wildcards.peak_type:
+        raise ValueError(
+            f"{wildcards.experiment} ({experiment['antibody']}) is called as "
+            f"{experiment['peak_type']} peaks, not {wildcards.peak_type}"
+        )
+    return {
+        "treatment": POOLED_BAM.format(experiment=wildcards.experiment),
+        "control": POOLED_BAM.format(experiment=experiment["control_experiment"]),
+    }
 
 
 rule all:
     input:
-        f"{DATA}/accessions/manifest.tsv"
+        ALIGNMENT_MANIFEST,
+        REPLICATE_MANIFEST,
+        MAPPING_STATS,
+        PAPER_COMPARISON
 
 
-rule resolve_accessions:
-    # Accessions/FASTQs are the same regardless of paper_exact vs. modern,
-    # so this writes under paths.data rather than the mode-specific RESULTS.
+checkpoint download_fastqs:
     input:
         accessions=ACCESSIONS
     output:
-        manifest=f"{DATA}/accessions/manifest.tsv",
-        metadata=f"{DATA}/accessions/metadata.jsonl",
-        samplesheet=f"{DATA}/accessions/samples.csv"
-    params:
-        assay_title=ASSAY_TITLE,
-        control_strategy=CONTROL_STRATEGY
-    log:
-        f"{LOGS}/setup/00_resolve_accessions.log"
-    script:
-        "scripts/00_resolve_accessions.py"
-
-
-rule download_fastqs:
-    input:
-        accessions=ACCESSIONS,
-        manifest=f"{DATA}/accessions/manifest.tsv"
-    output:
-        done=f"{DATA}/fastq/download.verified"
+        done=FASTQ_VERIFIED,
+        manifest=FASTQ_MANIFEST,
+        metadata=FASTQ_METADATA,
+        samplesheet=FASTQ_SAMPLESHEET
     params:
         assay_title=ASSAY_TITLE,
         control_strategy=CONTROL_STRATEGY
@@ -46,3 +350,436 @@ rule download_fastqs:
         f"{LOGS}/setup/01_download_fastqs.log"
     script:
         "scripts/01_download_fastqs.py"
+
+
+rule align_library:
+    input:
+        unpack(library_fastqs),
+        index=bowtie2_index_files(REFERENCE_INDEX_PREFIX)
+    output:
+        bam=ALIGNED_BAM,
+        bai=f"{ALIGNED_BAM}.bai"
+    params:
+        index_prefix=REFERENCE_INDEX_PREFIX,
+        max_fragment_length=config["alignment"]["max_fragment_length"],
+        read_group=read_group,
+        sort_threads=config["alignment"]["sort_threads"],
+        sort_memory=f"{config['alignment']['sort_memory_gb']}G"
+    threads: align_threads
+    resources:
+        mem_mb=align_mem_mb,
+        runtime=config["alignment"]["runtime_minutes"]
+    envmodules:
+        *config["alignment"]["envmodules"]
+    log:
+        bowtie2=f"{LOGS}/alignment/{{library}}.bowtie2.log",
+        samtools=f"{LOGS}/alignment/{{library}}.samtools.log"
+    benchmark:
+        f"{BENCHMARKS}/alignment/{{library}}.tsv"
+    shell:
+        # samtools sort spills temporary chunks to scratch and writes the final
+        # BAM straight to results, so nothing has to cross filesystems.
+        # --mm memory-maps the index, so jobs on the same node share one copy.
+        """
+        tmp_prefix="/scratch/$USER/${{SLURM_JOB_ID:-local}}/{wildcards.library}"
+        mkdir -p "$(dirname "$tmp_prefix")"
+
+        bowtie2 --threads {threads} --mm -X {params.max_fragment_length} \
+            {params.read_group} \
+            -x {params.index_prefix} -1 {input.fastq_1} -2 {input.fastq_2} \
+            2> {log.bowtie2} \
+            | samtools sort -@ {params.sort_threads} -m {params.sort_memory} \
+                -T "$tmp_prefix" -o {output.bam} - 2> {log.samtools}
+
+        samtools index -@ {threads} {output.bam} 2>> {log.samtools}
+        """
+
+
+rule merge_replicate:
+    input:
+        bams=replicate_library_bams
+    output:
+        bam=REPLICATE_BAM,
+        bai=f"{REPLICATE_BAM}.bai"
+    # Merge time is mostly BGZF compression, which scales with threads.
+    threads: 8
+    resources:
+        mem_mb=8000,
+        runtime=240
+    envmodules:
+        *config["alignment"]["envmodules"]
+    log:
+        f"{LOGS}/alignment/replicates/{{replicate}}.samtools.log"
+    benchmark:
+        f"{BENCHMARKS}/alignment/replicates/{{replicate}}.tsv"
+    shell:
+        # Inputs are coordinate-sorted, so the merged BAM is too. A replicate
+        # with a single FASTQ pair still goes through merge, so every replicate
+        # BAM has the same layout and provenance in its header.
+        """
+        samtools merge -@ {threads} -o {output.bam} {input.bams} 2> {log}
+        samtools index -@ {threads} {output.bam} 2>> {log}
+        """
+
+
+rule alignment_manifests:
+    input:
+        library_bams=aligned_bams,
+        replicate_bams=replicate_bams
+    output:
+        libraries=ALIGNMENT_MANIFEST,
+        replicates=REPLICATE_MANIFEST
+    params:
+        libraries=lambda wildcards: libraries(),
+        replicates=lambda wildcards: replicates(),
+        reference_name=REFERENCE_NAME
+    script:
+        "scripts/02_write_alignment_manifests.py"
+
+
+######## Step 03: read filter and duplicate removal ########
+
+
+rule filter_replicate:
+    input:
+        bam=REPLICATE_BAM
+    output:
+        # Only flagstat and deduplication read this, so it is deleted after both.
+        bam=temp(FILTERED_BAM)
+    params:
+        exclude_flags=config["filtering"]["exclude_flags"],
+        require_flags=config["filtering"]["require_flags"],
+        minimum_mapq=config["filtering"]["minimum_mapq"]
+    threads: 8
+    resources:
+        mem_mb=4000,
+        runtime=120
+    envmodules:
+        *config["filtering"]["envmodules"]
+    log:
+        f"{LOGS}/filtering/{{replicate}}.filter.log"
+    benchmark:
+        f"{BENCHMARKS}/filtering/{{replicate}}.filter.tsv"
+    shell:
+        # Paper: samtools view -F 1804 -f 2 -q 2 (proper pairs, primary, mapped,
+        # not QC-failed or duplicate, MAPQ >= 2).
+        """
+        samtools view -@ {threads} -b -F {params.exclude_flags} -f {params.require_flags} \
+            -q {params.minimum_mapq} -o {output.bam} {input.bam} 2> {log}
+        """
+
+
+rule deduplicate_replicate:
+    input:
+        bam=FILTERED_BAM
+    output:
+        bam=DEDUP_BAM,
+        bai=f"{DEDUP_BAM}.bai",
+        metrics=f"{FILTER_DIR}/dedup/{{replicate}}.duplication_metrics.txt"
+    params:
+        java_memory=f"-Xmx{config['filtering']['picard_memory_gb']}g"
+    threads: 4
+    resources:
+        mem_mb=(config["filtering"]["picard_memory_gb"] + 4) * 1024,
+        runtime=360
+    envmodules:
+        *config["filtering"]["envmodules"]
+    log:
+        f"{LOGS}/filtering/{{replicate}}.dedup.log"
+    benchmark:
+        f"{BENCHMARKS}/filtering/{{replicate}}.dedup.tsv"
+    shell:
+        # Paper: Picard MarkDuplicates REMOVE_DUPLICATES=true on name-ordered
+        # BAMs. Here the input is coordinate-sorted (deviation D8). All runs of a
+        # replicate share one read-group LB, so duplicates are found across runs.
+        """
+        tmp_dir="/scratch/$USER/${{SLURM_JOB_ID:-local}}/picard_{wildcards.replicate}"
+        mkdir -p "$tmp_dir"
+        picard {params.java_memory} MarkDuplicates \
+            --INPUT {input.bam} --OUTPUT {output.bam} --METRICS_FILE {output.metrics} \
+            --REMOVE_DUPLICATES true --VALIDATION_STRINGENCY LENIENT \
+            --TMP_DIR "$tmp_dir" 2> {log}
+        samtools index -@ {threads} {output.bam} 2>> {log}
+        rm -rf "$tmp_dir"
+        """
+
+
+rule flagstat:
+    input:
+        bam=lambda wildcards: STEP_BAMS[wildcards.step].format(replicate=wildcards.replicate)
+    output:
+        FLAGSTAT
+    threads: 4
+    resources:
+        mem_mb=2000,
+        runtime=60
+    envmodules:
+        *config["filtering"]["envmodules"]
+    log:
+        f"{LOGS}/filtering/flagstat/{{step}}/{{replicate}}.log"
+    shell:
+        "samtools flagstat -@ {threads} -O json {input.bam} > {output} 2> {log}"
+
+
+######## Step 04: unique-k-mer tracks and filter ########
+
+
+rule build_kmc:
+    output:
+        kmc=KMC_BIN,
+        genome_counts=KMC_GENOME_COUNTS
+    params:
+        repository=KMER_SETTINGS["kmc_repository"],
+        commit=KMER_SETTINGS["kmc_commit"]
+    threads: 8
+    resources:
+        mem_mb=8000,
+        runtime=60
+    log:
+        f"{LOGS}/kmer/build_kmc.log"
+    shell:
+        # The authors' KMC fork provides kmc_genome_counts, which writes the
+        # genome count of the k-mer starting at every position.
+        """
+        mkdir -p "/scratch/$USER"
+        build=$(mktemp -d "/scratch/$USER/kmc_build.XXXXXX")
+        git clone --quiet {params.repository} "$build/KMC" > {log} 2>&1
+        git -C "$build/KMC" checkout --quiet {params.commit} >> {log} 2>&1
+        make -C "$build/KMC" -j {threads} kmc kmc_genome_counts >> {log} 2>&1
+        cp "$build/KMC/bin/kmc" {output.kmc}
+        cp "$build/KMC/bin/kmc_genome_counts" {output.genome_counts}
+        rm -rf "$build"
+        """
+
+
+rule download_wigtobigwig:
+    output:
+        WIGTOBIGWIG
+    params:
+        url=KMER_SETTINGS["wigtobigwig_url"]
+    log:
+        f"{LOGS}/kmer/download_wigtobigwig.log"
+    shell:
+        "curl -fsSL -o {output} {params.url} 2> {log} && chmod a+rx {output}"
+
+
+rule kmer_reference:
+    input:
+        fasta=REFERENCE_FASTA,
+        fai=f"{REFERENCE_FASTA}.fai"
+    output:
+        fasta=KMER_FASTA,
+        fai=f"{KMER_FASTA}.fai",
+        sizes=f"{KMER_DIR}/{REFERENCE_NAME}.kmer_chromosomes.sizes"
+    params:
+        chromosomes=lambda wildcards: " ".join(kmer_chromosomes())
+    threads: 1
+    resources:
+        mem_mb=8000,
+        runtime=60
+    envmodules:
+        *config["filtering"]["envmodules"]
+    log:
+        f"{LOGS}/kmer/kmer_reference.log"
+    shell:
+        # k-mers are counted on these sequences only (chrY excluded, deviation
+        # D1), so uniqueness is judged as in the paper's Y-less reference.
+        """
+        samtools faidx {input.fasta} {params.chromosomes} > {output.fasta} 2> {log}
+        samtools faidx {output.fasta} 2>> {log}
+        cut -f1,2 {output.fai} > {output.sizes}
+        """
+
+
+rule count_kmers:
+    input:
+        fasta=KMER_FASTA,
+        kmc=KMC_BIN
+    output:
+        pre=temp(f"{KMER_DB}.kmc_pre"),
+        suf=temp(f"{KMER_DB}.kmc_suf")
+    params:
+        prefix=KMER_DB,
+        memory_gb=KMER_SETTINGS["kmc_memory_gb"]
+    threads: KMER_SETTINGS["kmc_threads"]
+    resources:
+        mem_mb=(KMER_SETTINGS["kmc_memory_gb"] + 8) * 1024,
+        runtime=360
+    log:
+        f"{LOGS}/kmer/count_kmers_k{{k}}.log"
+    benchmark:
+        f"{BENCHMARKS}/kmer/count_kmers_k{{k}}.tsv"
+    shell:
+        # Paper: kmc -k{k} -fm -ci2. -ci2 stores only k-mers seen at least twice;
+        # kmc_genome_counts reports positions missing from the database as 1.
+        """
+        tmp_dir="/scratch/$USER/${{SLURM_JOB_ID:-local}}/kmc_k{wildcards.k}"
+        mkdir -p "$tmp_dir"
+        {input.kmc} -k{wildcards.k} -m{params.memory_gb} -fm -ci2 -t{threads} \
+            {input.fasta} {params.prefix} "$tmp_dir" > {log} 2>&1
+        rm -rf "$tmp_dir"
+        """
+
+
+rule make_kmer_track:
+    input:
+        pre=f"{KMER_DB}.kmc_pre",
+        suf=f"{KMER_DB}.kmc_suf",
+        fasta=KMER_FASTA,
+        sizes=f"{KMER_DIR}/{REFERENCE_NAME}.kmer_chromosomes.sizes",
+        genome_counts=KMC_GENOME_COUNTS,
+        wigtobigwig=WIGTOBIGWIG
+    output:
+        KMER_TRACK
+    params:
+        prefix=KMER_DB,
+        chromosomes=lambda wildcards: " ".join(kmer_chromosomes())
+    # One kmc_genome_counts process per chromosome, as in the authors' pipeline.
+    threads: lambda wildcards: len(kmer_chromosomes())
+    resources:
+        mem_mb=KMER_SETTINGS["track_memory_gb"] * 1024,
+        runtime=720
+    log:
+        f"{LOGS}/kmer/make_kmer_track_k{{k}}.log"
+    benchmark:
+        f"{BENCHMARKS}/kmer/make_kmer_track_k{{k}}.tsv"
+    shell:
+        # kmc_genome_counts exits with status 1 after its last chromosome even
+        # when it succeeds, so only exit codes above 1 count as failures.
+        """
+        tmp_dir="/scratch/$USER/${{SLURM_JOB_ID:-local}}/kmer_track_k{wildcards.k}"
+        mkdir -p "$tmp_dir"
+        pids=()
+        for chrom in {params.chromosomes}; do
+            {input.genome_counts} -ch"$chrom" {params.prefix} {input.fasta} \
+                > "$tmp_dir/$chrom.wig" 2> "$tmp_dir/$chrom.log" &
+            pids+=($!)
+        done
+        failed=0
+        for pid in "${{pids[@]}}"; do
+            status=0
+            wait "$pid" || status=$?
+            if [ "$status" -gt 1 ]; then failed=1; fi
+        done
+        cat "$tmp_dir"/*.log > {log}
+        if [ "$failed" -ne 0 ]; then echo "kmc_genome_counts failed" >> {log}; exit 1; fi
+        for chrom in {params.chromosomes}; do
+            if [ ! -s "$tmp_dir/$chrom.wig" ]; then echo "empty track for $chrom" >> {log}; exit 1; fi
+            cat "$tmp_dir/$chrom.wig"
+        done > "$tmp_dir/all.wig"
+        {input.wigtobigwig} -clip "$tmp_dir/all.wig" {input.sizes} {output} >> {log} 2>&1
+        rm -rf "$tmp_dir"
+        """
+
+
+rule filter_unique_kmers:
+    input:
+        bam=DEDUP_BAM,
+        bai=f"{DEDUP_BAM}.bai",
+        tracks=expand(KMER_TRACK, k=KMER_SIZES)
+    output:
+        bam=KMER_BAM,
+        bai=f"{KMER_BAM}.bai",
+        stats=f"{FILTER_DIR}/kmer/{{replicate}}.kmer_filter.json"
+    params:
+        script=SCRIPTS_DIR / "04_filter_by_unique_kmers.py",
+        sizes=",".join(str(k) for k in KMER_SIZES)
+    threads: 4
+    resources:
+        mem_mb=8000,
+        runtime=1440
+    envmodules:
+        *KMER_SETTINGS["envmodules"]
+    log:
+        f"{LOGS}/filtering/{{replicate}}.kmer_filter.log"
+    benchmark:
+        f"{BENCHMARKS}/filtering/{{replicate}}.kmer_filter.tsv"
+    shell:
+        """
+        tmp_dir="/scratch/$USER/${{SLURM_JOB_ID:-local}}/kmer_filter_{wildcards.replicate}"
+        mkdir -p "$tmp_dir"
+        python {params.script} --bam {input.bam} --out "$tmp_dir/unsorted.bam" \
+            --stats {output.stats} --sizes {params.sizes} --tracks {input.tracks} 2> {log}
+        samtools sort -@ {threads} -T "$tmp_dir/sort" -o {output.bam} "$tmp_dir/unsorted.bam" 2>> {log}
+        samtools index -@ {threads} {output.bam} 2>> {log}
+        rm -rf "$tmp_dir"
+        """
+
+
+######## Step 05: pooled peak calling ########
+
+
+rule pool_experiment:
+    input:
+        bams=pooled_replicate_bams
+    output:
+        bam=POOLED_BAM,
+        bai=f"{POOLED_BAM}.bai"
+    threads: 8
+    resources:
+        mem_mb=4000,
+        runtime=120
+    envmodules:
+        *config["filtering"]["envmodules"]
+    log:
+        f"{LOGS}/peaks/{{experiment}}.pool.log"
+    shell:
+        """
+        samtools merge -@ {threads} -o {output.bam} {input.bams} 2> {log}
+        samtools index -@ {threads} {output.bam} 2>> {log}
+        """
+
+
+rule call_peaks:
+    input:
+        unpack(peak_calling_bams)
+    output:
+        PEAKS
+    params:
+        outdir=f"{PEAKS_DIR}/macs3",
+        genome_size=config["peak_calling"]["genome_size"],
+        broad=lambda wildcards: "--broad" if wildcards.peak_type == "broad" else ""
+    threads: 1
+    resources:
+        mem_mb=16000,
+        runtime=360
+    envmodules:
+        *config["peak_calling"]["envmodules"]
+    log:
+        f"{LOGS}/peaks/{{experiment}}.{{peak_type}}.macs3.log"
+    benchmark:
+        f"{BENCHMARKS}/peaks/{{experiment}}.{{peak_type}}.tsv"
+    shell:
+        # Paper: MACS2 2.2.7.1 -f BAMPE, broad peaks for broad marks. MACS3 here
+        # (deviation D7).
+        """
+        macs3 callpeak -t {input.treatment} -c {input.control} -f BAMPE \
+            -g {params.genome_size} -n {wildcards.experiment} --outdir {params.outdir} \
+            {params.broad} 2> {log}
+        """
+
+
+######## Step 06: comparison with the paper ########
+
+
+rule compare_with_paper:
+    input:
+        flagstats=flagstat_files,
+        peaks=peak_files,
+        authors=expand(
+            "{directory}/{name}",
+            directory=config["comparison"]["authors_results"],
+            name=["encode_samples.txt", "mapping_stats.txt", "macs2_peak_overlap.txt"],
+        )
+    output:
+        mapping_stats=MAPPING_STATS,
+        comparison=PAPER_COMPARISON
+    params:
+        replicates=lambda wildcards: replicates(),
+        experiments=lambda wildcards: experiments(),
+        flagstat_keys=lambda wildcards: flagstat_keys(),
+        peak_experiments=lambda wildcards: case_experiments(),
+        authors_dir=config["comparison"]["authors_results"],
+        reference_name=REFERENCE_NAME
+    script:
+        "scripts/06_compare_with_paper.py"

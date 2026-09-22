@@ -6,6 +6,7 @@ platforms = ["osx-arm64", "linux-64"]
 
 [dependencies]
 python = "3.11.*"
+ipykernel = ">=7.3.0,<8"
 
 [feature.workflow.dependencies]
 snakemake-minimal = ">=8,<9"

@@ -4,18 +4,23 @@ latency-wait: 60
 rerun-incomplete: true
 printshellcmds: true
 show-failed-logs: true
+software-deployment-method:
+  - env-modules
+# Karakoram has Slurm accounting disabled, so sacct never reports finished
+# jobs and Snakemake waits forever. squeue works: MinJobAge is 300 s.
+slurm-status-command: squeue
 
+# No default cpus_per_task: without it the Slurm plugin requests each rule's
+# `threads` as CPUs, so align_library's size-scaled threads reach Slurm.
 default-resources:
   slurm_partition: cpu
-  cpus_per_task: 1
   mem_mb: 4000
   runtime: 60
 
+# align_library and merge_replicate set threads, mem_mb and runtime in the
+# Snakefile (alignment settings in config/config.yaml). Entries here would
+# override those.
 set-resources:
-  resolve_accessions:
-    cpus_per_task: 1
-    mem_mb: 1000
-    runtime: 15
   download_fastqs:
     cpus_per_task: 4
     mem_mb: 4000
